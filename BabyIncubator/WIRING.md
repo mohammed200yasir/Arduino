@@ -62,7 +62,7 @@
 
 ## المكتبات المطلوبة (Library Manager)
 ```
-LiquidCrystal I2C  - by Frank de Brabander
+LCD I2C            - by Blackhack
 DHT sensor library - by Adafruit
 Adafruit MLX90614  - by Adafruit
 ```

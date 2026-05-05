@@ -16,7 +16,7 @@
  */
 
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <LCD_I2C.h>
 #include <DHT.h>
 #include <Adafruit_MLX90614.h>
 
@@ -29,7 +29,7 @@
 #define BTN_DOWN    3    // Lower target temp
 
 // ── Objects ───────────────────────────────────────────────────────────────
-LiquidCrystal_I2C lcd(0x27, 16, 4);  // Change to 0x3F if screen stays blank
+LCD_I2C lcd(0x27, 16, 4);  // Change to 0x3F if screen stays blank
 DHT               dht(DHT_PIN, DHT_TYPE);
 Adafruit_MLX90614 mlx;
 
@@ -72,7 +72,7 @@ void setup() {
   digitalWrite(FAN_RELAY,  HIGH);   // OFF
   digitalWrite(HEAT_RELAY, HIGH);   // OFF
 
-  lcd.init();
+  lcd.begin();
   lcd.backlight();
   lcd.createChar(0, heartChar);
 
