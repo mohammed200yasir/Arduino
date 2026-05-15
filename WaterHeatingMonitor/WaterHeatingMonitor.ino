@@ -10,13 +10,13 @@
  */
 
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
+#include <LCD_I2C.h>
 #include <Keypad.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 // ───────────────────────── LCD ─────────────────────────
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+LCD_I2C lcd(0x27, 16, 2);
 
 // ─────────────────────── Keypad ────────────────────────
 const byte ROWS = 4, COLS = 4;
@@ -344,7 +344,7 @@ void setup() {
 
   ds18b20.begin();
 
-  lcd.init();
+  lcd.begin();
   lcd.backlight();
   lcd.clear();
   showScreen(); // show water-level input screen on boot
