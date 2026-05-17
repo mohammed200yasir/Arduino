@@ -49,42 +49,49 @@ OneWire            oneWire(ONE_WIRE_BUS);
 DallasTemperature  ds18b20(&oneWire);
 
 // ─────────────────────── Config ────────────────────────
-#define TANK_HEIGHT_CM      27.0
-#define TURBIDITY_LIMIT     50.0   // fixed threshold: cleaning starts above 50%
-#define DRAIN_STOP_PCT      5.0    // consider tank empty when water drops to 5%
-#define LEVEL_TOLERANCE     3.0    // pump starts when diff exceeds ±3%
-#define LEVEL_HYSTERESIS    1.0    // pump stops when within ±1% of target
-#define SENSOR_READ_MS      700
-#define DISPLAY_UPDATE_MS   500
+#define TANK_HEIGHT_CM        27.0
+#define TURBIDITY_LIMIT       50.0    // cleaning triggers above this %
+#define TURBID_CONFIRM_COUNT  5       // must exceed limit for 5 readings (~3.5s) before cleaning
+#define DRAIN_STOP_PCT        5.0     // tank considered empty at this %
+#define MIN_DRAIN_MS          10000UL // outlet runs at least 10 s before checking level
+#define CLEAN_COOLDOWN_MS     30000UL // wait 30 s after cleaning before next cycle allowed
+#define LEVEL_TOLERANCE       3.0     // pump starts when level deviates by more than ±3%
+#define LEVEL_HYSTERESIS      1.0     // pump stops when level is within ±1% of target
+#define SENSOR_READ_MS        700
+#define DISPLAY_UPDATE_MS     500
 
 // ──────────────────────── State ────────────────────────
 enum Mode       { MODE_MAIN, MODE_WATER_INPUT, MODE_TEMP_INPUT, MODE_TURBIDITY_MONITOR };
 enum CleanState { CLEAN_IDLE, CLEAN_DRAIN, CLEAN_FILL };
-enum PumpState  { PUMP_IDLE, PUMP_FILLING, PUMP_DRAINING };   // tracks active pump
+enum PumpState  { PUMP_IDLE, PUMP_FILLING, PUMP_DRAINING };
 
-Mode           currentMode  = MODE_WATER_INPUT;
-String         inputBuffer  = "";
+Mode           currentMode   = MODE_WATER_INPUT;
+String         inputBuffer   = "";
 
-float          waterPct     = 0.0;   // measured water level (%)
-float          tempC        = 0.0;   // measured temperature (°C)
-float          turbidityPct = 0.0;   // measured turbidity (0–100%)
-bool           turbid       = false;
+float          waterPct      = 0.0;
+float          tempC         = 0.0;
+float          turbidityPct  = 0.0;
+bool           turbid        = false;   // true only after TURBID_CONFIRM_COUNT readings
+uint8_t        turbidCount   = 0;       // debounce counter
 
-int            targetWater  = 0;     // desired water level (%)
-int            targetTemp   = 0;     // desired temperature (°C)
-bool           waterSet     = false;
-bool           tempSet      = false;
+int            targetWater   = 0;
+int            targetTemp    = 0;
+bool           waterSet      = false;
+bool           tempSet       = false;
 
 bool           levelReached  = false;
 CleanState     cleanState    = CLEAN_IDLE;
-PumpState      pumpState     = PUMP_IDLE;   // current active pump in normal mode
-bool           heaterWasOn   = false;       // remembers heater state before cleaning
-bool           heaterRunning = false;       // actual heater relay state
+PumpState      pumpState     = PUMP_IDLE;
+bool           heaterWasOn   = false;
+bool           heaterRunning = false;
 
-bool           buzzerActive = false;
-unsigned long  buzzerEnd    = 0;
-unsigned long  lastSensor   = 0;
-unsigned long  lastDisplay  = 0;
+unsigned long  drainStartTime   = 0;    // when CLEAN_DRAIN phase began
+unsigned long  cleanCooldownEnd = 0;    // millis() when next cleaning is allowed
+
+bool           buzzerActive  = false;
+unsigned long  buzzerEnd     = 0;
+unsigned long  lastSensor    = 0;
+unsigned long  lastDisplay   = 0;
 
 // ══════════════════════════════════════════════════════
 //  HARDWARE HELPERS
@@ -94,10 +101,45 @@ void relaySet(uint8_t pin, bool on) {
   digitalWrite(pin, on ? RELAY_ON : RELAY_OFF);
 }
 
+// Turn off ALL relays — used as safety call
+void allOff() {
+  relaySet(INLET_RELAY,  false);
+  relaySet(OUTLET_RELAY, false);
+  relaySet(TEMP_RELAY,   false);
+  pumpState     = PUMP_IDLE;
+  heaterRunning = false;
+}
+
 void buzzerBeep(uint16_t ms) {
   digitalWrite(BUZZER_PIN, HIGH);
   buzzerActive = true;
   buzzerEnd    = millis() + ms;
+}
+
+// Write pump relays only when state actually changes.
+void applyPumpState(PumpState desired) {
+  if (desired == pumpState) return;
+  pumpState = desired;
+  switch (pumpState) {
+    case PUMP_FILLING:
+      relaySet(OUTLET_RELAY, false); // outlet OFF first
+      relaySet(INLET_RELAY,  true);  // then inlet ON
+      break;
+    case PUMP_DRAINING:
+      relaySet(INLET_RELAY,  false); // inlet OFF first
+      relaySet(OUTLET_RELAY, true);  // then outlet ON
+      break;
+    case PUMP_IDLE:
+      relaySet(INLET_RELAY,  false);
+      relaySet(OUTLET_RELAY, false);
+      break;
+  }
+}
+
+void applyHeater(bool on) {
+  if (on == heaterRunning) return;
+  heaterRunning = on;
+  relaySet(TEMP_RELAY, on);
 }
 
 // ══════════════════════════════════════════════════════
@@ -113,16 +155,24 @@ float getDistanceCm() {
 }
 
 void readSensors() {
+  // Water level
   float dist = getDistanceCm();
   if (dist >= 0.0 && dist <= TANK_HEIGHT_CM)
     waterPct = constrain(((TANK_HEIGHT_CM - dist) / TANK_HEIGHT_CM) * 100.0, 0.0, 100.0);
 
+  // Temperature
   ds18b20.requestTemperatures();
   float t = ds18b20.getTempCByIndex(0);
   if (t != DEVICE_DISCONNECTED_C && t > -50.0) tempC = t;
 
+  // Turbidity with debounce: must exceed limit for TURBID_CONFIRM_COUNT readings
   turbidityPct = (analogRead(TURBIDITY_PIN) / 1023.0) * 100.0;
-  turbid       = (turbidityPct > TURBIDITY_LIMIT);
+  if (turbidityPct > TURBIDITY_LIMIT) {
+    if (turbidCount < TURBID_CONFIRM_COUNT) turbidCount++;
+  } else {
+    if (turbidCount > 0) turbidCount--;   // ramps down when clean
+  }
+  turbid = (turbidCount >= TURBID_CONFIRM_COUNT);
 }
 
 // ══════════════════════════════════════════════════════
@@ -131,21 +181,16 @@ void readSensors() {
 
 /*
  * Line 1: "W:XXX%id T:XXX C"
- * Line 2: "T:XX% CLN  S:XX%"   or   "T:XX%!TRB  S:XX%"
+ * Line 2: "T:XX% CLN  S:XX%"  or "T:XX%!TRB  S:XX%"
  */
 void drawMain() {
   char line1[17], line2[17];
-
   snprintf(line1, sizeof(line1), "W:%3d%%%s T:%3dC",
-           (int)waterPct,
-           levelReached ? "id" : "  ",
-           (int)tempC);
-
+           (int)waterPct, levelReached ? "id" : "  ", (int)tempC);
   snprintf(line2, sizeof(line2), "T:%2d%% %s  S:%2d%%",
            (int)turbidityPct,
            turbid ? "!TRB" : " CLN",
            waterSet ? targetWater : 0);
-
   lcd.setCursor(0, 0); lcd.print(line1);
   lcd.setCursor(0, 1); lcd.print(line2);
 }
@@ -165,19 +210,23 @@ void drawTempInput() {
 }
 
 /*
- * B key: turbidity monitor screen (read-only, no input)
- * Line 1: "Turbidity:      "
- * Line 2: "Value:  XX.X %  "  + warning if above limit
+ * B screen: diagnostic — shows both water level AND turbidity so user can
+ * verify sensors and spot if turbidity is falsely triggering cleaning.
+ * Line 1: "W:XXX%  Trb:XX% "
+ * Line 2: "CLN/!HIGH  [state]"
  */
 void drawTurbidityMonitor() {
-  char line2[17];
-  lcd.setCursor(0, 0);
-  lcd.print("Turbidity:      ");
-  snprintf(line2, sizeof(line2), "%-6s %5.1f %%  ",
+  char line1[17], line2[17];
+  snprintf(line1, sizeof(line1), "W:%3d%% Trb:%2d%% ",
+           (int)waterPct, (int)turbidityPct);
+  const char* stateStr = "NORMAL ";
+  if (cleanState == CLEAN_DRAIN) stateStr = "DRNING ";
+  else if (cleanState == CLEAN_FILL) stateStr = "FILLING";
+  snprintf(line2, sizeof(line2), "%-5s  %s",
            turbid ? "!HIGH" : "OK",
-           turbidityPct);
-  lcd.setCursor(0, 1);
-  lcd.print(line2);
+           stateStr);
+  lcd.setCursor(0, 0); lcd.print(line1);
+  lcd.setCursor(0, 1); lcd.print(line2);
 }
 
 void showScreen() {
@@ -200,13 +249,11 @@ void showError(const char* msg1, const char* msg2) {
 // ══════════════════════════════════════════════════════
 
 void handleKey(char k) {
-  // ── Global navigation ──
   if (k == 'A') {
     currentMode = MODE_WATER_INPUT; inputBuffer = "";
     lcd.clear(); showScreen(); return;
   }
   if (k == 'B') {
-    // Turbidity monitor: display-only, no input needed
     currentMode = MODE_TURBIDITY_MONITOR;
     lcd.clear(); showScreen(); return;
   }
@@ -219,7 +266,6 @@ void handleKey(char k) {
     lcd.clear(); showScreen(); return;
   }
 
-  // In MAIN and TURBIDITY_MONITOR: only navigation keys work
   if (currentMode == MODE_MAIN || currentMode == MODE_TURBIDITY_MONITOR) return;
 
   if (k == '*') { inputBuffer = ""; showScreen(); return; }
@@ -236,8 +282,9 @@ void handleKey(char k) {
         targetWater  = val;
         waterSet     = true;
         levelReached = false;
-        pumpState    = PUMP_IDLE;      // reset pump state for new target
-        applyPumpState(PUMP_IDLE);     // stop any running pump immediately
+        // BUG FIX: do NOT manually set pumpState before calling applyPumpState.
+        // applyPumpState handles the relay write only if state changes.
+        applyPumpState(PUMP_IDLE);
         inputBuffer  = "";
         currentMode  = MODE_MAIN;
         lcd.clear(); showScreen();
@@ -262,24 +309,53 @@ void handleKey(char k) {
 //  CONTROL LOGIC
 // ══════════════════════════════════════════════════════
 
+void runNormalControl() {
+  // ── Water level ──
+  if (waterSet) {
+    float diff = waterPct - targetWater;
+
+    if (pumpState == PUMP_FILLING) {
+      if (diff >= -LEVEL_HYSTERESIS) {          // reached target
+        applyPumpState(PUMP_IDLE);
+        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
+      }
+    } else if (pumpState == PUMP_DRAINING) {
+      if (diff <= LEVEL_HYSTERESIS) {           // drained to target
+        applyPumpState(PUMP_IDLE);
+        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
+      }
+    } else {
+      // PUMP_IDLE: start pumping only when deviation > tolerance
+      if      (diff < -LEVEL_TOLERANCE) applyPumpState(PUMP_FILLING);
+      else if (diff >  LEVEL_TOLERANCE) applyPumpState(PUMP_DRAINING);
+    }
+  } else {
+    applyPumpState(PUMP_IDLE);
+  }
+
+  // ── Heater: requires tempSet AND water >= 50% ──
+  if (tempSet && waterPct >= 50.0 && tempC < targetTemp)
+    applyHeater(true);
+  else
+    applyHeater(false);
+}
+
 /*
- * Turbidity cleaning cycle (state machine):
- *   CLEAN_IDLE  → turbidity > 50% detected → save heater state, start CLEAN_DRAIN
- *   CLEAN_DRAIN → outlet pump ON until water ≤ DRAIN_STOP_PCT → switch to CLEAN_FILL
- *   CLEAN_FILL  → inlet pump ON until water reaches targetWater (or 50% if not set)
- *               → restore heater, go back to CLEAN_IDLE
+ * Turbidity cleaning state machine.
+ * Debounce prevents false triggers; MIN_DRAIN_MS prevents skipping drain phase;
+ * CLEAN_COOLDOWN_MS prevents immediate re-trigger after cleaning finishes.
  */
 void runTurbidityControl() {
-  // Decide fill target: use user target if set, otherwise 50%
   int fillTarget = waterSet ? targetWater : 50;
 
   switch (cleanState) {
 
     case CLEAN_IDLE:
-      if (turbid) {
-        heaterWasOn = heaterRunning;   // save current heater state
-        applyHeater(false);            // heater OFF
-        applyPumpState(PUMP_DRAINING); // start draining
+      if (turbid && millis() >= cleanCooldownEnd) {
+        heaterWasOn    = heaterRunning;
+        applyHeater(false);
+        applyPumpState(PUMP_DRAINING);
+        drainStartTime = millis();
         buzzerBeep(3000);
         cleanState = CLEAN_DRAIN;
       }
@@ -288,8 +364,9 @@ void runTurbidityControl() {
     case CLEAN_DRAIN:
       applyHeater(false);
       applyPumpState(PUMP_DRAINING);
-      if (waterPct <= DRAIN_STOP_PCT) {
-        applyPumpState(PUMP_FILLING);  // switch to refill
+      // Only switch to fill once outlet has run for MIN_DRAIN_MS AND tank is near empty
+      if (millis() - drainStartTime >= MIN_DRAIN_MS && waterPct <= DRAIN_STOP_PCT) {
+        applyPumpState(PUMP_FILLING);
         cleanState = CLEAN_FILL;
       }
       break;
@@ -300,6 +377,8 @@ void runTurbidityControl() {
       if (waterPct >= fillTarget - LEVEL_HYSTERESIS) {
         applyPumpState(PUMP_IDLE);
         if (heaterWasOn && waterPct >= 50.0) applyHeater(true);
+        cleanCooldownEnd = millis() + CLEAN_COOLDOWN_MS; // 30 s before next clean
+        turbidCount = 0;  // reset debounce so sensor must re-confirm turbidity
         buzzerBeep(1500);
         cleanState = CLEAN_IDLE;
       }
@@ -307,77 +386,11 @@ void runTurbidityControl() {
   }
 }
 
-// Apply a pump state change only when it actually differs from current state.
-// This prevents relay chatter from running on every loop iteration.
-void applyPumpState(PumpState desired) {
-  if (desired == pumpState) return;   // nothing to change
-  pumpState = desired;
-  switch (pumpState) {
-    case PUMP_FILLING:
-      relaySet(OUTLET_RELAY, false);  // outlet OFF first, then inlet ON
-      relaySet(INLET_RELAY,  true);
-      break;
-    case PUMP_DRAINING:
-      relaySet(INLET_RELAY,  false);  // inlet OFF first, then outlet ON
-      relaySet(OUTLET_RELAY, true);
-      break;
-    case PUMP_IDLE:
-      relaySet(INLET_RELAY,  false);
-      relaySet(OUTLET_RELAY, false);
-      break;
-  }
-}
-
-void applyHeater(bool on) {
-  if (on == heaterRunning) return;    // nothing to change
-  heaterRunning = on;
-  relaySet(TEMP_RELAY, on);
-}
-
-void runNormalControl() {
-  // ── Water level control with hysteresis ──
-  if (waterSet) {
-    float diff = waterPct - targetWater;
-
-    if (pumpState == PUMP_FILLING) {
-      // Currently filling: stop only when water reaches target - hysteresis
-      if (diff >= -LEVEL_HYSTERESIS) {
-        applyPumpState(PUMP_IDLE);
-        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
-      }
-    } else if (pumpState == PUMP_DRAINING) {
-      // Currently draining: stop only when water drops to target + hysteresis
-      if (diff <= LEVEL_HYSTERESIS) {
-        applyPumpState(PUMP_IDLE);
-        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
-      }
-    } else {
-      // Idle: start a pump only when deviation exceeds tolerance
-      if (diff < -LEVEL_TOLERANCE) {
-        applyPumpState(PUMP_FILLING);    // water too low → fill
-      } else if (diff > LEVEL_TOLERANCE) {
-        applyPumpState(PUMP_DRAINING);   // water too high → drain
-      }
-    }
-  } else {
-    applyPumpState(PUMP_IDLE);
-  }
-
-  // ── Heater: only when tempSet AND water >= 50% ──
-  if (tempSet && waterPct >= 50.0 && tempC < targetTemp) {
-    applyHeater(true);
-  } else {
-    applyHeater(false);
-  }
-}
-
 void runControl() {
-  if (turbid || cleanState != CLEAN_IDLE) {
-    // Hand full control to the cleaning state machine
+  if (turbid || cleanState != CLEAN_IDLE)
     runTurbidityControl();
-  } else {
+  else
     runNormalControl();
-  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -395,8 +408,7 @@ void setup() {
   pinMode(OUTLET_RELAY, OUTPUT);
   pinMode(BUZZER_PIN,   OUTPUT);
 
-  relaySet(INLET_RELAY,  false);
-  relaySet(OUTLET_RELAY, false);
+  allOff();
   digitalWrite(BUZZER_PIN, LOW);
 
   ds18b20.begin();
