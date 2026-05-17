@@ -50,35 +50,35 @@ DallasTemperature  ds18b20(&oneWire);
 
 // ─────────────────────── Config ────────────────────────
 #define TANK_HEIGHT_CM      27.0
-#define TURBIDITY_THRESHOLD 500    // 0-1023; tune for your sensor (higher = more turbid)
+#define TURBIDITY_LIMIT     50.0   // fixed threshold: cleaning starts above 50%
+#define DRAIN_STOP_PCT      5.0    // consider tank empty when water drops to 5%
 #define LEVEL_TOLERANCE     2.0    // ±2% dead-band for pump control
-#define SENSOR_READ_MS      700    // sensor refresh period
-#define DISPLAY_UPDATE_MS   500    // main-screen refresh period
+#define SENSOR_READ_MS      700
+#define DISPLAY_UPDATE_MS   500
 
 // ──────────────────────── State ────────────────────────
-enum Mode { MODE_MAIN, MODE_WATER_INPUT, MODE_TEMP_INPUT, MODE_TURBIDITY_INPUT };
+enum Mode       { MODE_MAIN, MODE_WATER_INPUT, MODE_TEMP_INPUT, MODE_TURBIDITY_MONITOR };
+enum CleanState { CLEAN_IDLE, CLEAN_DRAIN, CLEAN_FILL };
 
-Mode           currentMode    = MODE_WATER_INPUT;
-String         inputBuffer    = "";
+Mode           currentMode  = MODE_WATER_INPUT;
+String         inputBuffer  = "";
 
-float          waterPct       = 0.0;   // measured water level (%)
-float          tempC          = 0.0;   // measured temperature (°C)
-float          turbidityPct   = 0.0;   // measured turbidity (0-100%)
-bool           turbid         = false;
+float          waterPct     = 0.0;   // measured water level (%)
+float          tempC        = 0.0;   // measured temperature (°C)
+float          turbidityPct = 0.0;   // measured turbidity (0–100%)
+bool           turbid       = false;
 
-int            targetWater    = 0;     // desired water level (%)
-int            targetTemp     = 0;     // desired temperature (°C)
-int            turbidityLimit = 50;    // max acceptable turbidity % (default 50%)
-bool           waterSet       = false;
-bool           tempSet        = false;
-bool           turbiditySet   = false;
+int            targetWater  = 0;     // desired water level (%)
+int            targetTemp   = 0;     // desired temperature (°C)
+bool           waterSet     = false;
+bool           tempSet      = false;
 
-bool           levelReached   = false; // flag: target water level achieved (stays true while maintaining)
-bool           cleaningMode   = false; // flag: turbidity flush in progress
+bool           levelReached = false;
+CleanState     cleanState   = CLEAN_IDLE;
+bool           heaterWasOn  = false; // remembers heater state before cleaning
 
 bool           buzzerActive = false;
 unsigned long  buzzerEnd    = 0;
-
 unsigned long  lastSensor   = 0;
 unsigned long  lastDisplay  = 0;
 
@@ -101,33 +101,24 @@ void buzzerBeep(uint16_t ms) {
 // ══════════════════════════════════════════════════════
 
 float getDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // 25 ms timeout ≈ 4.3 m max
-  if (duration == 0) return -1.0;
-  return duration * 0.0343 / 2.0;
+  long d = pulseIn(ECHO_PIN, HIGH, 25000);
+  return d ? d * 0.0343 / 2.0 : -1.0;
 }
 
 void readSensors() {
-  // Ultrasonic → water level
   float dist = getDistanceCm();
-  if (dist >= 0.0 && dist <= TANK_HEIGHT_CM) {
-    float h = TANK_HEIGHT_CM - dist;
-    waterPct = constrain((h / TANK_HEIGHT_CM) * 100.0, 0.0, 100.0);
-  }
+  if (dist >= 0.0 && dist <= TANK_HEIGHT_CM)
+    waterPct = constrain(((TANK_HEIGHT_CM - dist) / TANK_HEIGHT_CM) * 100.0, 0.0, 100.0);
 
-  // DS18B20 temperature
   ds18b20.requestTemperatures();
   float t = ds18b20.getTempCByIndex(0);
   if (t != DEVICE_DISCONNECTED_C && t > -50.0) tempC = t;
 
-  // Turbidity: convert raw reading to percentage, compare against user limit
   turbidityPct = (analogRead(TURBIDITY_PIN) / 1023.0) * 100.0;
-  turbid = (turbidityPct > turbidityLimit);
+  turbid       = (turbidityPct > TURBIDITY_LIMIT);
 }
 
 // ══════════════════════════════════════════════════════
@@ -135,8 +126,8 @@ void readSensors() {
 // ══════════════════════════════════════════════════════
 
 /*
- * Line 1: "W:XXX%id T:XXX C"   (id shown when level reached)
- * Line 2: "TRB:XX%>XX S:XX%"   turbidity reading > limit, water setpoint
+ * Line 1: "W:XXX%id T:XXX C"
+ * Line 2: "T:XX% CLN  S:XX%"   or   "T:XX%!TRB  S:XX%"
  */
 void drawMain() {
   char line1[17], line2[17];
@@ -146,11 +137,9 @@ void drawMain() {
            levelReached ? "id" : "  ",
            (int)tempC);
 
-  // Show turbidity reading vs limit, and water setpoint
-  snprintf(line2, sizeof(line2), "%s%2d%%>%2d%% S:%2d%%",
-           turbid ? "!" : " ",
+  snprintf(line2, sizeof(line2), "T:%2d%% %s  S:%2d%%",
            (int)turbidityPct,
-           turbidityLimit,
+           turbid ? "!TRB" : " CLN",
            waterSet ? targetWater : 0);
 
   lcd.setCursor(0, 0); lcd.print(line1);
@@ -171,18 +160,27 @@ void drawTempInput() {
   lcd.print(row.substring(0, 16));
 }
 
-void drawTurbidityInput() {
-  lcd.setCursor(0, 0); lcd.print("Turbidity Lim%: ");
+/*
+ * B key: turbidity monitor screen (read-only, no input)
+ * Line 1: "Turbidity:      "
+ * Line 2: "Value:  XX.X %  "  + warning if above limit
+ */
+void drawTurbidityMonitor() {
+  char line2[17];
+  lcd.setCursor(0, 0);
+  lcd.print("Turbidity:      ");
+  snprintf(line2, sizeof(line2), "%-6s %5.1f %%  ",
+           turbid ? "!HIGH" : "OK",
+           turbidityPct);
   lcd.setCursor(0, 1);
-  String row = "> " + inputBuffer + "_              ";
-  lcd.print(row.substring(0, 16));
+  lcd.print(line2);
 }
 
 void showScreen() {
-  if      (currentMode == MODE_MAIN)             drawMain();
-  else if (currentMode == MODE_WATER_INPUT)      drawWaterInput();
-  else if (currentMode == MODE_TEMP_INPUT)       drawTempInput();
-  else if (currentMode == MODE_TURBIDITY_INPUT)  drawTurbidityInput();
+  if      (currentMode == MODE_MAIN)               drawMain();
+  else if (currentMode == MODE_WATER_INPUT)        drawWaterInput();
+  else if (currentMode == MODE_TEMP_INPUT)         drawTempInput();
+  else if (currentMode == MODE_TURBIDITY_MONITOR)  drawTurbidityMonitor();
 }
 
 void showError(const char* msg1, const char* msg2) {
@@ -198,46 +196,29 @@ void showError(const char* msg1, const char* msg2) {
 // ══════════════════════════════════════════════════════
 
 void handleKey(char k) {
-  // ── Global navigation keys ──
+  // ── Global navigation ──
   if (k == 'A') {
-    currentMode = MODE_WATER_INPUT;
-    inputBuffer = "";
-    lcd.clear();
-    showScreen();
-    return;
+    currentMode = MODE_WATER_INPUT; inputBuffer = "";
+    lcd.clear(); showScreen(); return;
   }
   if (k == 'B') {
-    currentMode = MODE_TURBIDITY_INPUT;
-    inputBuffer = "";
-    lcd.clear();
-    showScreen();
-    return;
+    // Turbidity monitor: display-only, no input needed
+    currentMode = MODE_TURBIDITY_MONITOR;
+    lcd.clear(); showScreen(); return;
   }
   if (k == 'C') {
     currentMode = MODE_MAIN;
-    lcd.clear();
-    showScreen();
-    return;
+    lcd.clear(); showScreen(); return;
   }
   if (k == 'D') {
-    currentMode = MODE_TEMP_INPUT;
-    inputBuffer = "";
-    lcd.clear();
-    showScreen();
-    return;
+    currentMode = MODE_TEMP_INPUT; inputBuffer = "";
+    lcd.clear(); showScreen(); return;
   }
 
-  // ── Input-screen keys (do nothing in MAIN) ──
-  if (currentMode == MODE_MAIN) return;
+  // In MAIN and TURBIDITY_MONITOR: only navigation keys work
+  if (currentMode == MODE_MAIN || currentMode == MODE_TURBIDITY_MONITOR) return;
 
-  // B/A/D/C already handled above; guard remaining keys for input modes only
-
-
-  if (k == '*') {
-    inputBuffer = "";
-    showScreen();
-    return;
-  }
+  if (k == '*') { inputBuffer = ""; showScreen(); return; }
 
   if (k == '#') {
     if (inputBuffer.length() == 0) return;
@@ -246,42 +227,25 @@ void handleKey(char k) {
     if (currentMode == MODE_WATER_INPUT) {
       if (val > 100) {
         showError("Invalid!(0-100) ", "Try again...    ");
-        inputBuffer = "";
-        showScreen();
+        inputBuffer = ""; showScreen();
       } else {
         targetWater  = val;
         waterSet     = true;
         levelReached = false;
         inputBuffer  = "";
         currentMode  = MODE_MAIN;
-        lcd.clear();
-        showScreen();
+        lcd.clear(); showScreen();
       }
     } else if (currentMode == MODE_TEMP_INPUT) {
       targetTemp  = val;
       tempSet     = true;
       inputBuffer = "";
       currentMode = MODE_MAIN;
-      lcd.clear();
-      showScreen();
-    } else if (currentMode == MODE_TURBIDITY_INPUT) {
-      if (val > 100) {
-        showError("Invalid!(0-100) ", "Try again...    ");
-        inputBuffer = "";
-        showScreen();
-      } else {
-        turbidityLimit = val;
-        turbiditySet   = true;
-        inputBuffer    = "";
-        currentMode    = MODE_MAIN;
-        lcd.clear();
-        showScreen();
-      }
+      lcd.clear(); showScreen();
     }
     return;
   }
 
-  // ── Digit input (max 3 digits) ──
   if (k >= '0' && k <= '9' && inputBuffer.length() < 3) {
     inputBuffer += k;
     showScreen();
@@ -292,73 +256,96 @@ void handleKey(char k) {
 //  CONTROL LOGIC
 // ══════════════════════════════════════════════════════
 
-void runControl() {
-  // ── Turbidity cleaning mode ─────────────────────────
-  if (turbid) {
-    if (!cleaningMode) {
-      cleaningMode = true;
-      buzzerBeep(3000);  // alert: turbidity detected
-    }
+/*
+ * Turbidity cleaning cycle (state machine):
+ *   CLEAN_IDLE  → turbidity > 50% detected → save heater state, start CLEAN_DRAIN
+ *   CLEAN_DRAIN → outlet pump ON until water ≤ DRAIN_STOP_PCT → switch to CLEAN_FILL
+ *   CLEAN_FILL  → inlet pump ON until water reaches targetWater (or 50% if not set)
+ *               → restore heater, go back to CLEAN_IDLE
+ */
+void runTurbidityControl() {
+  // Decide fill target: use user target if set, otherwise 50%
+  int fillTarget = waterSet ? targetWater : 50;
 
-    relaySet(TEMP_RELAY, false); // heater always OFF during cleaning
+  switch (cleanState) {
 
-    // Run both pumps to exchange water, keeping level near 50%
-    if (waterPct >= 50.0) {
-      // Both pumps on: drain dirty + refill fresh simultaneously
-      relaySet(INLET_RELAY,  true);
+    case CLEAN_IDLE:
+      if (turbid) {
+        // Remember whether heater was logically active before cleaning
+        heaterWasOn = (tempSet && waterPct >= 50.0 && tempC < targetTemp);
+        relaySet(TEMP_RELAY, false);   // heater OFF
+        relaySet(OUTLET_RELAY, true);  // start draining
+        relaySet(INLET_RELAY,  false);
+        buzzerBeep(3000);
+        cleanState = CLEAN_DRAIN;
+      }
+      break;
+
+    case CLEAN_DRAIN:
+      relaySet(TEMP_RELAY,   false);
       relaySet(OUTLET_RELAY, true);
-    } else if (waterPct < 48.0) {
-      // Level dropped below 50% - only refill
-      relaySet(INLET_RELAY,  true);
-      relaySet(OUTLET_RELAY, false);
-    } else {
-      // 48–50%: stop, let sensors stabilise
       relaySet(INLET_RELAY,  false);
+      if (waterPct <= DRAIN_STOP_PCT) {
+        relaySet(OUTLET_RELAY, false); // stop draining
+        relaySet(INLET_RELAY,  true);  // start refilling
+        cleanState = CLEAN_FILL;
+      }
+      break;
+
+    case CLEAN_FILL:
+      relaySet(TEMP_RELAY,   false);
       relaySet(OUTLET_RELAY, false);
-    }
-    return; // skip normal control while cleaning
+      relaySet(INLET_RELAY,  true);
+      if (waterPct >= fillTarget - LEVEL_TOLERANCE) {
+        relaySet(INLET_RELAY, false);  // stop filling
+        // Restore heater if it was running before cleaning
+        if (heaterWasOn && waterPct >= 50.0) {
+          relaySet(TEMP_RELAY, true);
+        }
+        buzzerBeep(1500);   // alert: cleaning done
+        cleanState = CLEAN_IDLE;
+      }
+      break;
   }
+}
 
-  // ── Turbidity cleared ──────────────────────────────
-  cleaningMode = false;
-
-  // ── Normal water level control ─────────────────────
-  // Pumps maintain the level silently after first reach (no buzzer on maintenance).
+void runNormalControl() {
+  // ── Water level maintenance ──
   if (waterSet) {
     float diff = waterPct - targetWater;
-
     if (diff < -LEVEL_TOLERANCE) {
-      // Below target: fill (silent if already reached once)
       relaySet(INLET_RELAY,  true);
       relaySet(OUTLET_RELAY, false);
-
     } else if (diff > LEVEL_TOLERANCE) {
-      // Above target: drain (silent if already reached once)
       relaySet(OUTLET_RELAY, true);
       relaySet(INLET_RELAY,  false);
-
     } else {
-      // Within tolerance: stop pumps
       relaySet(INLET_RELAY,  false);
       relaySet(OUTLET_RELAY, false);
       if (!levelReached) {
-        // First time reaching target → sound buzzer and set flag
         levelReached = true;
         buzzerBeep(1500);
       }
-      // If levelReached already true, pumps just stopped silently (maintenance done)
     }
   } else {
     relaySet(INLET_RELAY,  false);
     relaySet(OUTLET_RELAY, false);
   }
 
-  // ── Heater control ─────────────────────────────────
-  // Heater only allowed when water level >= 50%
+  // ── Heater control (water >= 50% required) ──
   if (tempSet && waterPct >= 50.0) {
     relaySet(TEMP_RELAY, tempC < targetTemp);
   } else {
     relaySet(TEMP_RELAY, false);
+  }
+}
+
+void runControl() {
+  if (turbid || cleanState != CLEAN_IDLE) {
+    // Hand full control to the cleaning state machine
+    runTurbidityControl();
+  } else {
+    runNormalControl();
   }
 }
 
@@ -386,34 +373,29 @@ void setup() {
   lcd.begin();
   lcd.backlight();
   lcd.clear();
-  showScreen(); // show water-level input screen on boot
+  showScreen();
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Read sensors periodically
   if (now - lastSensor >= SENSOR_READ_MS) {
     lastSensor = now;
     readSensors();
   }
 
-  // Buzzer auto-off
   if (buzzerActive && now >= buzzerEnd) {
     digitalWrite(BUZZER_PIN, LOW);
     buzzerActive = false;
   }
 
-  // Keypad input
   char k = keypad.getKey();
   if (k) handleKey(k);
 
-  // Run actuator control
   runControl();
 
-  // Refresh main screen periodically (avoids flicker on input screens)
-  if (currentMode == MODE_MAIN && now - lastDisplay >= DISPLAY_UPDATE_MS) {
+  if (now - lastDisplay >= DISPLAY_UPDATE_MS) {
     lastDisplay = now;
-    drawMain();
+    showScreen();
   }
 }
