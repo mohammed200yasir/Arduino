@@ -5,8 +5,8 @@
  * Tank Height: 27 cm
  *
  * Relay wiring note:
- *   If your relay module is ACTIVE-LOW (common), change RELAY_ON to LOW and RELAY_OFF to HIGH.
- *   Default below assumes ACTIVE-HIGH relay module.
+ *   Default: ACTIVE-LOW relay module (most common 4-channel boards).
+ *   If your module is ACTIVE-HIGH, swap: RELAY_ON = HIGH, RELAY_OFF = LOW.
  */
 
 #include <Wire.h>
@@ -40,9 +40,9 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 #define ONE_WIRE_BUS    10
 #define TEMP_RELAY      11   // heater
 
-// Active-HIGH relay (change to LOW/HIGH if using active-low module)
-#define RELAY_ON   HIGH
-#define RELAY_OFF  LOW
+// Active-LOW relay module (common 4-channel boards): LOW = relay ON, HIGH = relay OFF
+#define RELAY_ON   LOW
+#define RELAY_OFF  HIGH
 
 // ────────────────────── Sensors ────────────────────────
 OneWire            oneWire(ONE_WIRE_BUS);
