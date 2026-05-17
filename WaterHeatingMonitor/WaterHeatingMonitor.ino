@@ -387,6 +387,14 @@ void runTurbidityControl() {
 }
 
 void runControl() {
+  // Do nothing until the user has entered a water level setpoint.
+  // This prevents pumps from running at startup.
+  if (!waterSet && cleanState == CLEAN_IDLE) {
+    applyPumpState(PUMP_IDLE);
+    applyHeater(false);
+    return;
+  }
+
   if (turbid || cleanState != CLEAN_IDLE)
     runTurbidityControl();
   else
@@ -398,17 +406,20 @@ void runControl() {
 // ══════════════════════════════════════════════════════
 
 void setup() {
-  // Heater OFF first — before any other init — for safety
-  pinMode(TEMP_RELAY, OUTPUT);
-  digitalWrite(TEMP_RELAY, RELAY_OFF);
+  // Set relay pins HIGH (inactive for active-LOW) BEFORE pinMode so the relay
+  // never receives a LOW glitch during pin initialisation.
+  digitalWrite(TEMP_RELAY,   RELAY_OFF);
+  digitalWrite(INLET_RELAY,  RELAY_OFF);
+  digitalWrite(OUTLET_RELAY, RELAY_OFF);
 
-  pinMode(TRIG_PIN,     OUTPUT);
-  pinMode(ECHO_PIN,     INPUT);
+  pinMode(TEMP_RELAY,   OUTPUT);
   pinMode(INLET_RELAY,  OUTPUT);
   pinMode(OUTLET_RELAY, OUTPUT);
+  pinMode(TRIG_PIN,     OUTPUT);
+  pinMode(ECHO_PIN,     INPUT);
   pinMode(BUZZER_PIN,   OUTPUT);
 
-  allOff();
+  allOff();                          // sync state variables with relay state
   digitalWrite(BUZZER_PIN, LOW);
 
   ds18b20.begin();
