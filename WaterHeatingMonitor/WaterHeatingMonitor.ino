@@ -52,13 +52,15 @@ DallasTemperature  ds18b20(&oneWire);
 #define TANK_HEIGHT_CM      27.0
 #define TURBIDITY_LIMIT     50.0   // fixed threshold: cleaning starts above 50%
 #define DRAIN_STOP_PCT      5.0    // consider tank empty when water drops to 5%
-#define LEVEL_TOLERANCE     2.0    // ±2% dead-band for pump control
+#define LEVEL_TOLERANCE     3.0    // pump starts when diff exceeds ±3%
+#define LEVEL_HYSTERESIS    1.0    // pump stops when within ±1% of target
 #define SENSOR_READ_MS      700
 #define DISPLAY_UPDATE_MS   500
 
 // ──────────────────────── State ────────────────────────
 enum Mode       { MODE_MAIN, MODE_WATER_INPUT, MODE_TEMP_INPUT, MODE_TURBIDITY_MONITOR };
 enum CleanState { CLEAN_IDLE, CLEAN_DRAIN, CLEAN_FILL };
+enum PumpState  { PUMP_IDLE, PUMP_FILLING, PUMP_DRAINING };   // tracks active pump
 
 Mode           currentMode  = MODE_WATER_INPUT;
 String         inputBuffer  = "";
@@ -73,9 +75,11 @@ int            targetTemp   = 0;     // desired temperature (°C)
 bool           waterSet     = false;
 bool           tempSet      = false;
 
-bool           levelReached = false;
-CleanState     cleanState   = CLEAN_IDLE;
-bool           heaterWasOn  = false; // remembers heater state before cleaning
+bool           levelReached  = false;
+CleanState     cleanState    = CLEAN_IDLE;
+PumpState      pumpState     = PUMP_IDLE;   // current active pump in normal mode
+bool           heaterWasOn   = false;       // remembers heater state before cleaning
+bool           heaterRunning = false;       // actual heater relay state
 
 bool           buzzerActive = false;
 unsigned long  buzzerEnd    = 0;
@@ -232,6 +236,8 @@ void handleKey(char k) {
         targetWater  = val;
         waterSet     = true;
         levelReached = false;
+        pumpState    = PUMP_IDLE;      // reset pump state for new target
+        applyPumpState(PUMP_IDLE);     // stop any running pump immediately
         inputBuffer  = "";
         currentMode  = MODE_MAIN;
         lcd.clear(); showScreen();
@@ -271,72 +277,97 @@ void runTurbidityControl() {
 
     case CLEAN_IDLE:
       if (turbid) {
-        // Remember whether heater was logically active before cleaning
-        heaterWasOn = (tempSet && waterPct >= 50.0 && tempC < targetTemp);
-        relaySet(TEMP_RELAY, false);   // heater OFF
-        relaySet(OUTLET_RELAY, true);  // start draining
-        relaySet(INLET_RELAY,  false);
+        heaterWasOn = heaterRunning;   // save current heater state
+        applyHeater(false);            // heater OFF
+        applyPumpState(PUMP_DRAINING); // start draining
         buzzerBeep(3000);
         cleanState = CLEAN_DRAIN;
       }
       break;
 
     case CLEAN_DRAIN:
-      relaySet(TEMP_RELAY,   false);
-      relaySet(OUTLET_RELAY, true);
-      relaySet(INLET_RELAY,  false);
+      applyHeater(false);
+      applyPumpState(PUMP_DRAINING);
       if (waterPct <= DRAIN_STOP_PCT) {
-        relaySet(OUTLET_RELAY, false); // stop draining
-        relaySet(INLET_RELAY,  true);  // start refilling
+        applyPumpState(PUMP_FILLING);  // switch to refill
         cleanState = CLEAN_FILL;
       }
       break;
 
     case CLEAN_FILL:
-      relaySet(TEMP_RELAY,   false);
-      relaySet(OUTLET_RELAY, false);
-      relaySet(INLET_RELAY,  true);
-      if (waterPct >= fillTarget - LEVEL_TOLERANCE) {
-        relaySet(INLET_RELAY, false);  // stop filling
-        // Restore heater if it was running before cleaning
-        if (heaterWasOn && waterPct >= 50.0) {
-          relaySet(TEMP_RELAY, true);
-        }
-        buzzerBeep(1500);   // alert: cleaning done
+      applyHeater(false);
+      applyPumpState(PUMP_FILLING);
+      if (waterPct >= fillTarget - LEVEL_HYSTERESIS) {
+        applyPumpState(PUMP_IDLE);
+        if (heaterWasOn && waterPct >= 50.0) applyHeater(true);
+        buzzerBeep(1500);
         cleanState = CLEAN_IDLE;
       }
       break;
   }
 }
 
+// Apply a pump state change only when it actually differs from current state.
+// This prevents relay chatter from running on every loop iteration.
+void applyPumpState(PumpState desired) {
+  if (desired == pumpState) return;   // nothing to change
+  pumpState = desired;
+  switch (pumpState) {
+    case PUMP_FILLING:
+      relaySet(OUTLET_RELAY, false);  // outlet OFF first, then inlet ON
+      relaySet(INLET_RELAY,  true);
+      break;
+    case PUMP_DRAINING:
+      relaySet(INLET_RELAY,  false);  // inlet OFF first, then outlet ON
+      relaySet(OUTLET_RELAY, true);
+      break;
+    case PUMP_IDLE:
+      relaySet(INLET_RELAY,  false);
+      relaySet(OUTLET_RELAY, false);
+      break;
+  }
+}
+
+void applyHeater(bool on) {
+  if (on == heaterRunning) return;    // nothing to change
+  heaterRunning = on;
+  relaySet(TEMP_RELAY, on);
+}
+
 void runNormalControl() {
-  // ── Water level maintenance ──
+  // ── Water level control with hysteresis ──
   if (waterSet) {
     float diff = waterPct - targetWater;
-    if (diff < -LEVEL_TOLERANCE) {
-      relaySet(INLET_RELAY,  true);
-      relaySet(OUTLET_RELAY, false);
-    } else if (diff > LEVEL_TOLERANCE) {
-      relaySet(OUTLET_RELAY, true);
-      relaySet(INLET_RELAY,  false);
+
+    if (pumpState == PUMP_FILLING) {
+      // Currently filling: stop only when water reaches target - hysteresis
+      if (diff >= -LEVEL_HYSTERESIS) {
+        applyPumpState(PUMP_IDLE);
+        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
+      }
+    } else if (pumpState == PUMP_DRAINING) {
+      // Currently draining: stop only when water drops to target + hysteresis
+      if (diff <= LEVEL_HYSTERESIS) {
+        applyPumpState(PUMP_IDLE);
+        if (!levelReached) { levelReached = true; buzzerBeep(1500); }
+      }
     } else {
-      relaySet(INLET_RELAY,  false);
-      relaySet(OUTLET_RELAY, false);
-      if (!levelReached) {
-        levelReached = true;
-        buzzerBeep(1500);
+      // Idle: start a pump only when deviation exceeds tolerance
+      if (diff < -LEVEL_TOLERANCE) {
+        applyPumpState(PUMP_FILLING);    // water too low → fill
+      } else if (diff > LEVEL_TOLERANCE) {
+        applyPumpState(PUMP_DRAINING);   // water too high → drain
       }
     }
   } else {
-    relaySet(INLET_RELAY,  false);
-    relaySet(OUTLET_RELAY, false);
+    applyPumpState(PUMP_IDLE);
   }
 
-  // ── Heater control (water >= 50% required) ──
-  if (tempSet && waterPct >= 50.0) {
-    relaySet(TEMP_RELAY, tempC < targetTemp);
+  // ── Heater: only when tempSet AND water >= 50% ──
+  if (tempSet && waterPct >= 50.0 && tempC < targetTemp) {
+    applyHeater(true);
   } else {
-    relaySet(TEMP_RELAY, false);
+    applyHeater(false);
   }
 }
 
